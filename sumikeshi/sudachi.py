@@ -16,7 +16,10 @@ def _tokenizer():
     if _TOK is None:
         try:
             from sudachipy import Dictionary, SplitMode
-            _TOK = (Dictionary().create(), SplitMode.C)
+            d = Dictionary()
+            # sudachipy 0.7 から create() は非推奨で tokenizer() に替わった。古い版は create() だけ
+            make = getattr(d, "tokenizer", None) or d.create
+            _TOK = (make(), SplitMode.C)
         except Exception:
             _TOK = False
     return _TOK

@@ -370,13 +370,24 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main(argv: list[str] | None = None) -> int:
-    # Windows の PowerShell で出力をファイルに向けたときも落ちないように
+def _setup_streams() -> None:
+    """出力の文字コード。日本語の Windows の画面ならそのまま。日本語を書けない行き先
+    （英語版 Windows でファイルや GitHub のログに向けたとき）は UTF-8 にする。どちらでも落ちないようにする。"""
     for stream in (sys.stdout, sys.stderr):
         try:
+            "日本語○×→".encode(stream.encoding or "ascii")
             stream.reconfigure(errors="replace")
+        except (UnicodeEncodeError, LookupError):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, ValueError):
+                pass
         except (AttributeError, ValueError):
             pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    _setup_streams()
     argv = sys.argv[1:] if argv is None else list(argv)
     # サブコマンドの無い呼び出し（EXE へのドラッグ＆ドロップ、ダブルクリック）はファイルの種類で振り分ける
     if (argv and argv[0] not in SUBCOMMANDS and not argv[0].startswith("-")) \
