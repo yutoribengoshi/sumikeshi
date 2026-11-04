@@ -37,8 +37,7 @@ def disable() -> None:
 
 def _rep(ch: str) -> str:
     # 異体字を代表字へ（1字→1字なので位置はずれない）。「髙橋」が未知語になるのを防ぐ
-    g = L.VARIANTS.get(ch)
-    return min(g) if g else ch
+    return L.VARIANT_REP.get(ch, ch)
 
 
 def tokens(text: str) -> list[tuple[str, tuple, int, int, bool]]:
@@ -84,6 +83,28 @@ def person(word: str) -> bool | None:
     if res is None and place:
         return False
     return res
+
+
+@lru_cache(maxsize=20000)
+def reading(word: str) -> str | None:
+    """漢字の名前の読み（カタカナ）。Sudachi が無いか、未知語を含むときは None。"""
+    tk = _tokenizer()
+    if not tk or not word:
+        return None
+    t, mode = tk
+    try:
+        ms = t.tokenize("".join(_rep(ch) for ch in word), mode)
+    except Exception:
+        return None
+    out = []
+    for m in ms:
+        if m.is_oov():
+            return None
+        r = m.reading_form()
+        if not r or any(not ("ァ" <= c <= "ヺ" or c == "ー") for c in r):
+            return None
+        out.append(r)
+    return "".join(out)
 
 
 def split_name(word: str) -> tuple[str, str] | None:

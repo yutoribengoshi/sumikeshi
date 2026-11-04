@@ -21,6 +21,7 @@ from . import sudachi as S
 from .collect import Collector, context_of
 from .detect import _pii, fold, protected_spans
 from .matcher import KUROFILL, Entry, Matcher, _AFTER_OK, core
+from .parts import OPAQUE_MARK
 
 PASS, WARN, FAIL = "合格", "要確認", "不合格"
 _RANK = {PASS: 0, WARN: 1, FAIL: 2}
@@ -85,20 +86,31 @@ def run(*, accepted: list[Entry], rejected: list[Entry], counts: dict[int, int] 
         lines.append(f"（この文書に出てこなかった候補 {len(absent)} 件: " + "、".join(e.original for e in absent[:10])
                      + ("…" if len(absent) > 10 else "") + "）")
     if counts is not None:
-        rep.section(f"置換した件数 合計 {total} 件", _cap(lines) if lines else ["置換したものはありません"])
+        if total == 0:
+            # 置換が1件も無いのに「合格」と言わない（一覧の取り違え・読めない形の文書のことがある）
+            rep.section("置換したものが1件もありません（一覧と文書の取り違え・文字として読めない文書でないか確認）",
+                        _cap(lines) if lines else [], WARN)
+        else:
+            rep.section(f"置換した件数 合計 {total} 件", _cap(lines))
 
     # 1 原文の残り
     strict = Matcher(accepted, guards=True)
     loose = Matcher(accepted, guards=False)
-    # 置き換えた後の記号（原文と同じにした行は除く。その行は伏せていないので残りとして数える）
+    # 置き換えた後の記号そのものは残りに数えない。ただし記号が別の行の原文と同じとき
+    # （山田太郎→鈴木一郎・鈴木一郎→山田太郎のような入れ替え）は数える
+    originals = {L.nfkc_name(e.original) for e in accepted}
     labels = {L.nfkc_name(e.replacement) for e in accepted
-              if e.replacement and L.nfkc_name(e.replacement) != L.nfkc_name(e.original)}
+              if e.replacement and L.nfkc_name(e.replacement) not in originals}
     fails, warns, infos = [], [], []
     for text, loc in out_strings:
+        opaque = loc.endswith(OPAQUE_MARK)
         for h in strict.find(text):
-            if L.nfkc_name(h.matched) in labels:      # 置き換えた後の記号そのもの
+            if L.nfkc_name(h.matched) in labels:
                 continue
-            fails.append(f"「{h.matched}」 {loc}: {context_of(text, h.start, h.end)}")
+            # 中を読めない部品（圧縮されたバイト列）では、偶然に現れうる2字以下の語は数えない
+            if opaque and len(core(strict.entries[h.entry].original)) < 3:
+                continue
+            fails.append(f"「{h.matched[:30]}」 {loc}: {context_of(text, h.start, h.end)[:80]}")
     # 語の一部として残ったものは、属性値（書式の番号など）でなく本文で見る
     for text, loc in out_units:
         found = {(h.start, h.end) for h in strict.find(text)}

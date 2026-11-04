@@ -16,13 +16,18 @@ HIRA = "ぁ-ゖゝゞ"
 ALNUM = "A-Za-z0-9Ａ-Ｚａ-ｚ０-９"
 
 # 字間の空白。改行は跨がせない（跨がせると無関係の語の連なりを人名と取り違える）。
-# ゼロ幅の文字も空白として扱う（名前の中に挟まると素通りするため）。
-SPACE_CLASS = " 　\t  -​⁠﻿"
+# 目に見えない文字も空白として扱う（名前の中に挟まると素通りするため）: ゼロ幅（ZWSP・ZWNJ・ZWJ・WJ）、
+# 方向の制御（LRM ほか）、ソフトハイフン、CGJ、異体字セレクタ（VS・IVS）、各種の幅の空白
+SPACE_CLASS = ("\t \u00a0\u00ad\u034f\u180e\u2000-\u200f\u202a-\u202f\u205f-\u2064\u3000\u3164"
+               "\ufe00-\ufe0f\ufeff\U000e0100-\U000e01ef")
 SP = f"[{SPACE_CLASS}]"
-SPACE_SET = set(" 　\t ⁠﻿") | {chr(c) for c in range(0x2002, 0x200C)}
+_SPACE_RANGES = [(0x09, 0x09), (0x20, 0x20), (0xA0, 0xA0), (0xAD, 0xAD), (0x34F, 0x34F), (0x180E, 0x180E),
+                 (0x2000, 0x200F), (0x202A, 0x202F), (0x205F, 0x2064), (0x3000, 0x3000), (0x3164, 0x3164),
+                 (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF), (0xE0100, 0xE01EF)]
+SPACE_SET = {chr(c) for a, b in _SPACE_RANGES for c in range(a, b + 1)}
 
 DIGIT = "0-9０-９"
-HYPHENS = "\\-－‐−ー―‑–"
+HYPHENS = "\\-－‐−ー―‑–—‒ｰ"
 
 # ---------------------------------------------------------------- 役割語
 # (語, 種別, 当事者の側)。側は置換後の記号に使う: X=申立ての側 / Y=相手の側 / ""=その他
@@ -238,7 +243,9 @@ CORP_PREFIX_STOP = set("""
 _VARIANT_GROUPS = """
 髙高 﨑崎嵜碕 邊邉辺 澤沢 濱浜 嶋島嶌 廣広 國国 櫻桜 惠恵 眞真 冨富 槇槙 曾曽 德徳 黑黒
 齋齊斎斉 藏蔵 戶戸 瀨瀬 龍竜 籠篭 實実 條条 萬万 壽寿 與与 會会 學学 榮栄 淺浅 豐豊 禮礼
-靜静 晉晋 彌弥 鷗鴎 舘館 﨔欅 辻辻
+靜静 晉晋 彌弥 鷗鴎 舘館 﨔欅 關関 內内 澁渋 瀧滝 渕淵渊 峯峰 栁柳 𠮷吉 鄕郷 靑青 龜亀
+圓円 對対 增増 桒桑 驒騨 舩船 檜桧 埜野 寬寛 晝昼 曉暁 硏研 淸清 戀恋 拔抜 槪概 濵浜
+ヶケ ヵカ (（ )） [［ ]］
 """.split()
 
 
@@ -253,12 +260,14 @@ def _build_variants() -> dict[str, set[str]]:
     for g in _VARIANT_GROUPS:
         for ch in g[1:]:
             link(g[0], ch)
-    # 互換漢字（U+F900–FAFF）は NFKC で統合漢字に寄る。逆向きも引けるように両方を結ぶ
-    for cp in range(0xF900, 0xFB00):
-        ch = chr(cp)
-        n = unicodedata.normalize("NFKC", ch)
-        if n != ch and len(n) == 1:
-            link(n, ch)
+    # 互換漢字・康熙部首（PDF からのコピーで「⽥」が混じる）・半角カナは NFKC で通常の字に寄る。
+    # 逆向きも引けるように両方を結ぶ（濁点つきの半角カナ「ﾀﾞ」は2字なので照合の側で扱う）
+    for lo, hi in ((0xF900, 0xFB00), (0x2E80, 0x2FE0), (0xFF61, 0xFFA0), (0x2F800, 0x2FA20)):
+        for cp in range(lo, hi):
+            ch = chr(cp)
+            n = unicodedata.normalize("NFKC", ch)
+            if n != ch and len(n) == 1:
+                link(n, ch)
     # 英数字の全角・半角（大文字と小文字は別の字。「b3」と記号の「Ｂ３」を同じにしない）
     for a, b in zip("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"):
         link(a, b)
@@ -273,12 +282,34 @@ def _build_variants() -> dict[str, set[str]]:
 VARIANTS = _build_variants()
 
 
+def _rep_key(c: str):
+    """代表字の選び方: 部首・互換漢字・半角カナより通常の字、通常の字の中では JIS の第1・第2水準の若い字。"""
+    cp = ord(c)
+    odd = (0x2E80 <= cp < 0x2FE0) or (0xF900 <= cp < 0xFB00) or (0xFF61 <= cp < 0xFFA0) or (0x2F800 <= cp < 0x2FA20)
+    try:
+        b = c.encode("euc_jp")
+        jis = len(b) == 2
+    except UnicodeEncodeError:
+        b, jis = b"\xff\xff\xff", False
+    return (odd, not jis, b, cp)
+
+
+VARIANT_REP = {c: min(g, key=_rep_key) for c, g in VARIANTS.items()}
+
+
 def nfkc_name(s: str) -> str:
-    """照合用の正規化（空白を除き、異体字を代表字に寄せる）。"""
+    """照合用の正規化（NFKC にそろえ、空白・不可視の文字を除き、異体字を代表字に寄せる）。"""
     out = []
-    for ch in s:
-        if ch in SPACE_SET:
-            continue
-        group = VARIANTS.get(ch)
-        out.append(min(group) if group else ch)
+    for ch in unicodedata.normalize("NFKC", "".join(c for c in s if c not in SPACE_SET)):
+        if ch not in SPACE_SET:
+            out.append(VARIANT_REP.get(ch, ch))
     return "".join(out)
+
+
+# 人の名前の前後に来る語（「患者山田」「山田容疑者」）。短い名前の境の判定に使う
+PERSON_BEFORE = """患者 容疑者 被疑者 被告人 事務員 職員 社員 店員 従業員 生徒 児童 学生 教諭 教師 医師 看護師
+運転手 乗客 住人 隣人 知人 友人 母親 父親 夫人 同僚 上司 部下 妻 夫 母 父 兄 弟 姉 妹 娘 息子 孫 甥 姪
+長男 長女 次男 次女 二男 二女 三男 三女 叔父 叔母 伯父 伯母 祖父 祖母 元夫 元妻 被害者 加害者 証人
+参考人 依頼者 相談者 担当者 代表者 申告者""".split()
+PERSON_AFTER = """容疑者 被疑者 被告人 被告 原告 患者 本人 夫人 嬢 一家 兄弟 姉妹 親子 夫妻 夫婦 家族 母子 父子
+少年 少女 選手 監督 議員 事務員 証人 名義 氏名 宅 方 家 邸 姓 らの""".split()

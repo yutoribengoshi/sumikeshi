@@ -62,4 +62,4 @@ def test_kuro_keeps_spacing():
 
 
 def test_zero_width_space_does_not_hide_name():
-    assert sub("山​田太郎", ("山田太郎", "Ａ", "人名")) == "Ａ"
+    assert sub("山" + chr(0x200B) + "田太郎", ("山田太郎", "Ａ", "人名")) == "Ａ"

@@ -8,6 +8,7 @@ from . import lexicon as L
 from . import sudachi as S
 from .detect import Hit, scan_unit
 from .matcher import KUROFILL, Entry, Matcher, core
+from .romaji import to_hepburn
 
 STYLES = ("xy", "abc", "maru", "kuro")
 NAME_KINDS = ("人名", "代理人", "法人")
@@ -46,6 +47,7 @@ class _Entity:
     sei: str = ""
     mei: str = ""
     label: str = ""
+    reading: str = ""
 
 
 def display_form(text: str) -> str:
@@ -64,6 +66,28 @@ def _split_name(name: str, sei: str, mei: str) -> tuple[str, str]:
         n = 3 if name[:3] in L.SUR3 else 2
         return name[:n], name[n:]
     return "", ""
+
+
+_CORP_ABBR = (("（株）", "株式会社"), ("(株)", "株式会社"), ("㈱", "株式会社"), ("（有）", "有限会社"),
+              ("(有)", "有限会社"), ("㈲", "有限会社"))
+_LABEL_LIKE = re.compile(r"(?<![A-Za-zＡ-Ｚａ-ｚ])([Ａ-ＺA-Z][０-９0-9]{0,2})(社)?(?![A-Za-zＡ-Ｚａ-ｚ])")
+
+
+def _corp_key(s: str) -> str:
+    """「(株)みどり建設」「㈱みどり建設」を「株式会社みどり建設」と同じ会社として数えるためのキー。"""
+    for a, b in _CORP_ABBR:
+        s = s.replace(a, b)
+    return L.nfkc_name(s)
+
+
+def _kana_key(s: str) -> str:
+    """読みの比べ方: 空白を除き、半角カナ・ひらがなをカタカナに。"""
+    s = L.nfkc_name(s)
+    return "".join(chr(ord(c) + 0x60) if "ぁ" <= c <= "ゖ" else c for c in s)
+
+
+def _to_hira(s: str) -> str:
+    return "".join(chr(ord(c) - 0x60) if "ァ" <= c <= "ヶ" else c for c in s)
 
 
 def _part_ok(part: str) -> bool:
@@ -143,9 +167,12 @@ class Collector:
         pending_parts: list[tuple[Hit, str]] = []
         for h, _idx in self.hits:
             disp = display_form(h.text)
+            if h.part in ("reading", "romaji"):
+                pending_parts.append((h, h.part))
+                continue
             if h.kind in NAME_KINDS and h.part in ("", "alias") and not (h.part == "" and h.entity):
                 if h.part == "alias":
-                    tkey = L.nfkc_name(h.entity or "")
+                    tkey = (_corp_key if h.kind == "法人" else L.nfkc_name)(h.entity or "")
                     ent_for(tkey, h.kind, core(h.entity or ""))
                     add_row(h.kind, disp, h.rule, h.conf, entity=tkey, part="alias")
                     continue
@@ -153,7 +180,7 @@ class Collector:
                 if len(c) >= 2 and h.rule.startswith("1字の姓"):
                     pending_parts.append((h, "title"))
                     continue
-                key = L.nfkc_name(c)
+                key = _corp_key(c) if h.kind == "法人" else L.nfkc_name(c)
                 e = ent_for(key, h.kind, disp, h.side)
                 if h.kind != "法人" and re.fullmatch(f"[{L.KANJI}]+", c):
                     sei, mei = _split_name(c, h.sei, h.mei)
@@ -180,12 +207,24 @@ class Collector:
                     del ents[sk]
                 add_row("法人", short, f"略称（{e.display} の）", "中", entity=e.key, part="short")
                 rows[sk].entity, rows[sk].part = e.key, "short"
+            # 「(株)みどり建設」「㈱みどり建設」の書き方でも当てる
+            for a, b in _CORP_ABBR:
+                if b in e.display:
+                    add_row("法人", e.display.replace(b, a), f"略記（{e.display} の）", "中", entity=e.key, part="short")
 
         # 姓・名（フルネームから）
         sei_owner: dict[str, list[_Entity]] = {}
         for e in ents.values():
             if e.kind != "法人" and e.sei:
                 sei_owner.setdefault(L.nfkc_name(e.sei), []).append(e)
+        # 役割語の後で姓だけ拾った人（「運転手山田」）は、その姓のフルネームが1人だけならその人に寄せる
+        for e in list(ents.values()):
+            owners = sei_owner.get(e.key, [])
+            if e.kind != "法人" and not e.mei and len(owners) == 1 and owners[0] is not e:
+                for r in rows.values():
+                    if r.entity == e.key:
+                        r.entity, r.part = owners[0].key, r.part or "sei"
+                del ents[e.key]
         for e in list(ents.values()):
             if e.kind == "法人" or not e.sei:
                 continue
@@ -198,10 +237,44 @@ class Collector:
             if _part_ok(e.mei):
                 add_row(e.kind, e.mei, f"名（{e.display} の）", "中", entity=e.key, part="mei")
 
-        # 形態素で拾った姓だけ・名だけ、1字の姓＋肩書き
+        # 読み（カナ・ひらがな・ローマ字）: 漢字の名前から作り、本文に出てくれば同じ記号で伏せる
+        for e in list(ents.values()):
+            name = core(e.display)
+            if e.kind == "法人" or not re.fullmatch(f"[{L.KANJI}]+", name):
+                continue
+            rd = S.reading(name)
+            if rd and len(rd) >= 3:
+                e.reading = rd
+                add_row(e.kind, rd, f"読み（{e.display} の）", "中", entity=e.key, part="reading")
+                add_row(e.kind, _to_hira(rd), f"読み（{e.display} の）", "中", entity=e.key, part="reading")
+            sr = S.reading(e.sei) if e.sei else None
+            mr = S.reading(e.mei) if e.mei else None
+            for r in (sr, mr):
+                if r and len(r) >= 3:
+                    add_row(e.kind, r, f"読み（{e.display} の）", "中", entity=e.key, part="reading")
+            if sr and mr:
+                rs, rm = to_hepburn(sr).capitalize(), to_hepburn(mr).capitalize()
+                if rs and rm:
+                    for disp in (f"{rm} {rs}", f"{rs} {rm}"):
+                        add_row("ローマ字", disp, f"ローマ字（{e.display} の）", "中", entity=e.key, part="romaji")
+
+        # 形態素で拾った姓だけ・名だけ、1字の姓＋肩書き、読み
         for h, part in pending_parts:
             c = core(h.text)
             key = L.nfkc_name(c)
+            if part in ("reading", "romaji"):
+                disp = display_form(h.text)
+                if h.entity:
+                    ek = L.nfkc_name(h.entity)
+                    if ek not in ents:
+                        ent_for(ek, "人名", core(h.entity))
+                    add_row(h.kind, disp, h.rule, h.conf, entity=ek, part=part)
+                else:
+                    owner = next((e for e in ents.values() if e.reading and e.reading == _kana_key(c)), None)
+                    if owner is None:
+                        owner = ent_for(L.nfkc_name(c), "人名", disp)
+                    add_row(h.kind, disp, h.rule, h.conf, entity=owner.key, part=part)
+                continue
             if part == "title":
                 head = c[0]
                 owners = [e for e in ents.values() if e.kind != "法人" and (e.sei == head or (not e.sei and e.display.startswith(head)))]
@@ -233,7 +306,7 @@ class Collector:
         self._assign_labels(ents, cands)
         self._count(cands)
         # 派生した行（姓・名・略称）で本文に1件も無いものは一覧から落とす
-        cands = [c for c in cands if c.count > 0 or (c.part not in ("sei", "mei", "short", "alias")
+        cands = [c for c in cands if c.count > 0 or (c.part not in ("sei", "mei", "short", "alias", "reading", "romaji")
                                                        and not c.rule.startswith("形態素"))]
         for c in cands:
             if c.count == 0:
@@ -244,8 +317,8 @@ class Collector:
 
         def sort_key(c: Candidate):
             e = ents.get(c.entity) if c.entity else None
-            if c.kind in NAME_KINDS and e is not None:
-                part_rank = {"": 0, "alias": 1, "short": 1, "title": 2, "sei": 3, "mei": 4}.get(c.part, 5)
+            if (c.kind in NAME_KINDS or c.part in ("reading", "romaji")) and e is not None:
+                part_rank = {"": 0, "alias": 1, "short": 1, "title": 2, "sei": 3, "mei": 4, "reading": 5, "romaji": 6}.get(c.part, 7)
                 return (0, e.order, part_rank, c.order)
             return (1, KIND_ORDER.index(c.kind) if c.kind in KIND_ORDER else 99, c.order, 0)
 
@@ -258,14 +331,21 @@ class Collector:
     def _assign_labels(self, ents: dict[str, _Entity], cands: list[Candidate]) -> None:
         style = self.style
         ordered = sorted(ents.values(), key=lambda e: e.order)
-        # 文書にもとからある伏せ字（「Ａ」「b3」）と同じ記号は使わない（検査で原文の残りと区別できなくなる）
+        # 文書にもとからある伏せ字（「Ａ社」「Ｂ」「b3」）と同じ記号は使わない
+        # （当事者が入れ替わって読める・検査で原文の残りと区別できなくなる）
         taken = {L.nfkc_name(c.original).upper() for c in cands}
+        for text, _src in self.units:
+            for m in _LABEL_LIKE.finditer(text):
+                taken.add(L.nfkc_name(m.group(0)).upper())
+                taken.add(L.nfkc_name(m.group(1)).upper())
         if style == "xy":
             xs = [e for e in ordered if e.side == "X"]
             ys = [e for e in ordered if e.side == "Y"]
             for grp, letter in ((xs, "Ｘ"), (ys, "Ｙ")):
                 for i, e in enumerate(grp, 1):
-                    e.label = letter if len(grp) == 1 else letter + str(i).translate(_FW_DIGITS)
+                    label = letter if len(grp) == 1 else letter + str(i).translate(_FW_DIGITS)
+                    if L.nfkc_name(label).upper() not in taken and L.nfkc_name(label + "社").upper() not in taken:
+                        e.label = label
         i = 0
         for e in ordered:
             if not e.label:
@@ -286,7 +366,7 @@ class Collector:
                 else:
                     c.replacement = KUROFILL * len(core(c.original))
                 continue
-            if c.kind in NAME_KINDS and e is not None:
+            if (c.kind in NAME_KINDS or c.part in ("reading", "romaji")) and e is not None:
                 label = "○○" if style == "maru" else e.label
                 if e.kind == "法人" and style != "maru":
                     label += "社"

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 
 from . import lexicon as L
@@ -26,9 +27,9 @@ _LATIN_CH = re.compile(f"[{L.ALNUM}]")
 _LATIN_ALPHA = re.compile("[A-Za-zＡ-Ｚａ-ｚ]")
 
 # 2字以下の名前の前に来てよい語（「原告山田」「訴外山田」）と、後ろに来てよい語（「山田弁護士」）
-_BEFORE_OK = sorted(set(L.NAME_PREFIXES) | set(L.ONE_CHAR_ROLES), key=len, reverse=True)
+_BEFORE_OK = sorted(set(L.NAME_PREFIXES) | set(L.ONE_CHAR_ROLES) | set(L.PERSON_BEFORE), key=len, reverse=True)
 _AFTER_OK = sorted(
-    set(L.TITLE_SUFFIXES) | set(L.HONORIFICS)
+    set(L.TITLE_SUFFIXES) | set(L.HONORIFICS) | set(L.PERSON_AFTER)
     | set("""作成 名義 所有 方 宅 家 邸 夫妻 夫婦 一家 側 ら 等 外 各 本人 自身 個人 名 姓 夫 妻 父 母
     兄 弟 姉 妹 長男 長女 次男 次女 二男 二女 子 代理人 証人 供述 証言 陳述 尋問 調書 名下 印
     及び 並びに 又は 若しくは""".split()),
@@ -58,11 +59,42 @@ def core(text: str) -> str:
     return "".join(ch for ch in text if ch not in L.SPACE_SET)
 
 
+_DAKUTEN, _HANDAKUTEN = chr(0x3099), chr(0x309A)
+_HW_DAKUTEN, _HW_HANDAKUTEN = chr(0xFF9E), chr(0xFF9F)
+
+
+def _halfwidth_kana() -> dict:
+    """全角カナ → 半角の書き方（「ダ」→「ﾀﾞ」）。濁点・半濁点つきは2字になる。"""
+    hw: dict = {}
+    for cp in range(0xFF66, 0xFF9E):
+        h = chr(cp)
+        f = unicodedata.normalize("NFKC", h)
+        if len(f) == 1:
+            hw.setdefault(f, []).append(h)
+    for f in list(hw):
+        for mark, hmark in ((_DAKUTEN, _HW_DAKUTEN), (_HANDAKUTEN, _HW_HANDAKUTEN)):
+            composed = unicodedata.normalize("NFC", f + mark)
+            if len(composed) == 1:
+                hw.setdefault(composed, []).extend(h + hmark for h in hw[f])
+    return hw
+
+
+_HW_KANA = _halfwidth_kana()
+
+
 def char_class(ch: str) -> str:
-    group = L.VARIANTS.get(ch)
-    if not group or len(group) == 1:
-        return re.escape(ch)
-    return "[" + "".join(re.escape(c) for c in sorted(group)) + "]"
+    """1字を、異体字・全角半角・濁点の分かれ（NFD）・半角カナの書き方まで含めて当てるパターンにする。"""
+    singles = set(L.VARIANTS.get(ch, {ch}))
+    multis: set = set()
+    for c in singles:
+        d = unicodedata.normalize("NFD", c)
+        if d != c:
+            multis.add(d)                      # macOS 由来の「タ＋濁点」
+        multis.update(x for x in _HW_KANA.get(c, []) if len(x) > 1)
+    cls = re.escape(ch) if len(singles) == 1 else "[" + "".join(re.escape(c) for c in sorted(singles)) + "]"
+    if not multis:
+        return cls
+    return "(?:" + "|".join(re.escape(x) for x in sorted(multis, key=len, reverse=True)) + "|" + cls + ")"
 
 
 def _digit_pattern(c: str, kind: str) -> str:
@@ -99,10 +131,33 @@ def _caseless_class(ch: str) -> str:
     return "[" + "".join(re.escape(c) for c in sorted(group)) + "]" if len(group) > 1 else re.escape(ch)
 
 
+def _romaji_pattern(text: str) -> str:
+    """ローマ字の名前（「Taro Yamada」）を、長音の書き方（Taro／Tarou／Taroh／Tarō）と大文字小文字、
+    b・m・p の前の n／m（Nanba／Namba）、全角の英字まで含めて当てるパターンにする。"""
+    words = [w for w in re.split(r"[\s,.・　]+", text.lower()) if w]
+    out = []
+    for w in words:
+        parts = []
+        for i, ch in enumerate(w):
+            nxt = w[i + 1] if i + 1 < len(w) else ""
+            if ch == "o":
+                parts.append("[oOōŌôÔｏＯ](?:[uUhHoOｕＵｈＨｏＯ])?")
+            elif ch == "u":
+                parts.append("[uUūŪûÛｕＵ](?:[uUｕＵ])?")
+            elif ch == "n" and nxt in ("b", "m", "p"):
+                parts.append("[nNmMｎＮｍＭ]")
+            else:
+                parts.append(_caseless_class(ch))
+        out.append("".join(parts))
+    return r"[\s,.・　]{0,3}".join(out)
+
+
 def entry_pattern(e: Entry) -> str | None:
     c = core(e.original)
     if not c:
         return None
+    if e.kind == "ローマ字":
+        return _romaji_pattern(e.original)
     digitish = re.fullmatch(f"[{L.DIGIT}{L.HYPHENS}()（）〒]+", c) is not None
     if e.kind in DIGIT_KINDS or (digitish and sum(1 for ch in c if _DIGIT_RE.match(ch)) >= 5):
         return _digit_pattern(c, e.kind)
@@ -126,6 +181,14 @@ def _starts_with_any(s: str, words: list[str]) -> bool:
     return any(s.startswith(w) for w in words)
 
 
+_XML_BAD = re.compile("[" + "".join(chr(c) for c in list(range(0, 9)) + [11, 12] + list(range(14, 32))) + chr(0xFFFE) + chr(0xFFFF) + "]")
+
+
+def clean_text(s: str) -> str:
+    """XML に書けない制御文字を除く（一覧に貼り付けたときに混じることがある）。"""
+    return _XML_BAD.sub("", s or "")
+
+
 class Matcher:
     """置換表をまとめて1本の正規表現にし、左から最長一致で探す。"""
 
@@ -134,6 +197,7 @@ class Matcher:
         self.entries: list[Entry] = []
         pats: list[tuple[int, int, str]] = []
         seen: set[str] = set()
+        entries = [Entry(clean_text(e.original), clean_text(e.replacement), e.kind, e.cid) for e in entries]
         for i, e in enumerate(entries):
             c = core(e.original)
             p = entry_pattern(e)

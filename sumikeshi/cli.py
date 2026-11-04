@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import re
 import sys
 import unicodedata
 from datetime import datetime
@@ -66,34 +67,49 @@ def _expand(args: list[str]) -> list[Path]:
 
     「読み取り禁止」の印があるものは名前を見るだけで開かず、本数だけ知らせる。
     """
-    out: list[Path] = []
+    out: list[tuple[Path, bool]] = []          # (ファイル, フォルダや * から拾ったか)
     blocked = 0
+    unsupported: list[str] = []
     for a in args:
-        paths = [Path(p) for p in glob.glob(a)] if any(ch in a for ch in "*?[") else [Path(a)]
+        expanded = any(ch in a for ch in "*?[")
+        paths = [Path(p) for p in glob.glob(a)] if expanded else [Path(a)]
         for p in paths:
             if blocked_path(p):
                 blocked += 1
             elif p.is_dir():
                 for q in sorted(p.iterdir()):
-                    if q.suffix.lower() not in SUPPORTED:
+                    if q.is_dir() or q.name.startswith((".", "~$")):
                         continue
-                    if blocked_path(q):
+                    if q.suffix.lower() not in SUPPORTED:
+                        unsupported.append(q.name)
+                    elif blocked_path(q):
                         blocked += 1
                     else:
-                        out.append(q)
+                        out.append((q, True))
             else:
-                out.append(p)
+                out.append((p, expanded))
     if blocked:
         print(f"「{BLOCK_MARK}」の印があるもの {blocked} 件は、開かずに外しました")
-    res = []
-    for p in out:
-        if p.name.startswith("~$") or SUFFIX_OUT in p.stem:
+    if unsupported:
+        names = "、".join(unsupported[:10]) + ("…" if len(unsupported) > 10 else "")
+        print(f"対応していない形式のファイル {len(unsupported)} 件は読んでいません（{names}）。"
+              "Word は .docx、Excel は PDF などに保存し直すと扱えます")
+    res, outputs = [], []
+    for p, picked in out:
+        if p.name.startswith("~$"):
+            continue
+        # フォルダや * から拾ったときだけ、このコマンドの出力（〜_匿名.docx など）を外す
+        if picked and re.search(r"_匿名(_不合格|_検査)?$|_候補$", p.stem):
+            outputs.append(p.name)
             continue
         if not p.exists():
             raise SystemExit(f"ファイルが見つかりません: {p}")
         if p.suffix.lower() not in SUPPORTED:
             raise SystemExit(f"対応していない形式です（{', '.join(SUPPORTED)}）: {p}")
         res.append(p.resolve())
+    if outputs:
+        print(f"このコマンドの出力の形の名前のファイル {len(outputs)} 件は読んでいません（{'、'.join(outputs[:5])}"
+              f"{'…' if len(outputs) > 5 else ''}）。元の文書なら、ファイルを直接指定してください")
     if not res:
         raise SystemExit("対象のファイルがありません")
     return res
@@ -146,7 +162,7 @@ def do_scan(args) -> int:
             units = _io(f).read_units(f)
         except Exception as e:  # 壊れたファイル・パスワード付きなど
             raise SystemExit(f"読めませんでした: {f}\n  {e}")
-        col.add(f.stem, f"{f.name}（ファイル名）")
+        col.add(unicodedata.normalize("NFC", f.stem), f"{f.name}（ファイル名）")
         for text, loc in units:
             col.add(text, f"{f.name} {loc}")
     cands = col.finalize()
@@ -183,12 +199,12 @@ def _chmod_private(path: Path) -> None:
 
 def _process(f: Path, acc: list[Entry], rej: list[Entry], outdir: Path | None, force: bool,
              list_path: Path | None, address: str) -> int:
-    from . import verify
-
     guard(f)
     io = _io(f)
     matcher = Matcher(acc)
-    stem = matcher.sub(f.stem)[0] if matcher else f.stem
+    # macOS のファイル名は濁点が分かれている（NFD）ことがあるので、そろえてから伏せる
+    nfc_stem = unicodedata.normalize("NFC", f.stem)
+    stem = matcher.sub(nfc_stem)[0] if matcher else nfc_stem
     outdir = outdir or f.parent
     outdir.mkdir(parents=True, exist_ok=True)
     out = outdir / f"{stem}{SUFFIX_OUT}{f.suffix}"
@@ -202,6 +218,19 @@ def _process(f: Path, acc: list[Entry], rej: list[Entry], outdir: Path | None, f
     tmp = outdir / f".{stem}{SUFFIX_OUT}.tmp{f.suffix}"
     notes: list[str] = []
     ext = f.suffix.lower()
+    try:
+        return _apply_and_check(f, io, ext, tmp, out, bad, report_path, stem, matcher, acc, rej, notes,
+                                list_path, address)
+    except ValueError as e:              # 伏せきれない形（Strict 形式・altChunk・読めない文字コード）は作らない
+        if tmp.exists():
+            tmp.unlink()
+        print(f"{f.name} → 作りませんでした（不合格）\n  {e}")
+        return 2
+
+
+def _apply_and_check(f, io, ext, tmp, out, bad, report_path, stem, matcher, acc, rej, notes, list_path, address):
+    from . import verify
+
     if ext in (".docx", ".docm"):
         st = io.apply(f, tmp, matcher)
         counts = st.counts
@@ -212,11 +241,15 @@ def _process(f: Path, acc: list[Entry], rej: list[Entry], outdir: Path | None, f
         if st.comments:
             notes.append(f"コメント {st.comments} 件を消しました")
         if st.images:
-            notes.append(f"画像 {st.images} 枚の中の文字（印影・写真・スキャン）は確かめていません")
+            notes.append(f"画像 {st.images} 枚は付帯情報（撮影者・作成者など）を取り除きました。"
+                         "絵の中の文字（印影・写真・スキャン）は確かめていません")
         if st.embeddings:
-            notes.append(f"埋め込みのファイル {st.embeddings} 個（Excel の表など）の中は確かめていません")
+            notes.append(f"埋め込みのファイル {st.embeddings} 個（グラフの元データの Excel など）は、中の文字も同じ規則で伏せました")
         if st.macros:
             notes.append("マクロが入っています。中は確かめていません")
+        if st.opaque:
+            notes.append(f"中を伏せられない部品 {len(st.opaque)} 個は、原文（3字以上）がそのまま入っていないかだけ確かめました"
+                         f"（{', '.join(st.opaque[:5])}{'…' if len(st.opaque) > 5 else ''}）")
         notes += st.warnings
     elif ext == ".pdf":
         st = io.apply(f, tmp, matcher)
@@ -227,6 +260,9 @@ def _process(f: Path, acc: list[Entry], rej: list[Entry], outdir: Path | None, f
             pages = st.pages_without_text
             notes.append(f"文字の層が無い頁があります（{', '.join(map(str, pages[:20]))}頁）。"
                          "画像だけの頁は伏せられないので、OCR してからもう一度")
+        if st.garbled_pages:
+            notes.append(f"文字の層が文字化けしている頁があります（{', '.join(map(str, st.garbled_pages[:20]))}頁）。"
+                         "フォントに文字の対応表が無く、伏せる語を探せません。OCR してからもう一度")
         if st.images:
             notes.append(f"画像 {st.images} 個の中の文字は、文字の層に無い限り確かめていません")
     else:
@@ -235,10 +271,12 @@ def _process(f: Path, acc: list[Entry], rej: list[Entry], outdir: Path | None, f
         structure = ("行数", io.line_count(f), io.line_count(tmp))
     rep = verify.run(accepted=acc, rejected=rej, counts=counts, matcher=matcher,
                      in_units=io.read_units(f), out_units=io.read_units(tmp),
-                     out_strings=io.all_strings(tmp) + [(stem, "ファイル名")],
+                     out_strings=io.all_strings(tmp) + [(unicodedata.normalize("NFC", out.stem), "ファイル名")],
                      structure=structure, hygiene=hyg, notes=notes, address=address)
     if ext == ".pdf" and st.pages_without_text:
         rep.bump(verify.WARN if len(st.pages_without_text) < st.pages else verify.FAIL)
+    if ext == ".pdf" and st.garbled_pages:
+        rep.bump(verify.FAIL)
     final = bad if rep.verdict == verify.FAIL else out
     if final.exists():
         final.unlink()
@@ -255,6 +293,8 @@ def _process(f: Path, acc: list[Entry], rej: list[Entry], outdir: Path | None, f
             print(f"  {title}")
             for ln in lines[:3]:
                 print(f"      {ln}")
+        elif title.startswith("○ 参考"):
+            print(f"  （参考）語の一部として残した2字以下の語が {len(lines)} 件あります。報告で確かめてください")
     if rep.verdict == verify.FAIL:
         print("  ※ 不合格です。このファイルはまだ外に出さないでください。")
     return rep.exit_code
