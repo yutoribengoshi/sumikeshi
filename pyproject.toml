@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sumikeshi"
+version = "0.1.0"
+description = "法律文書（Word・テキスト・PDF）の名前・住所・電話番号などを、手元の PC だけで置換・墨消しする"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["lxml>=4.9", "openpyxl>=3.0"]
+
+[project.optional-dependencies]
+sudachi = ["sudachipy>=0.6", "sudachidict_core"]
+pdf = ["pymupdf>=1.23"]
+all = ["sudachipy>=0.6", "sudachidict_core", "pymupdf>=1.23"]
+dev = ["pytest", "python-docx>=1.0"]
+
+[project.scripts]
+sumikeshi = "sumikeshi.cli:main"
+
+[tool.setuptools]
+packages = ["sumikeshi"]

@@ -1,0 +1,17 @@
+_sessions/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+# 案件の文書・候補一覧・検査の報告（伏せる前の名前が入る）をリポジトリに入れない
+*.docx
+*.docm
+*.pdf
+*.xlsx
+*.csv
+*.txt
+*_匿名*
+!requirements*.txt
+!packaging/*.txt
