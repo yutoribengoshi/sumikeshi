@@ -1,0 +1,73 @@
+name: Windows EXE
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # v で始まるタグのとき、リリースに zip を載せるため
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 依存を入れる
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[sudachi,dev]" pyinstaller
+
+      - name: 試験（Windows）
+        run: python -m pytest -q
+
+      - name: EXE を作る
+        run: >
+          pyinstaller --noconfirm --clean --onedir --console --name sumikeshi
+          --collect-all sudachipy --collect-all sudachidict_core --collect-submodules sumikeshi
+          packaging/entry.py
+
+      - name: できた EXE で通しを確かめる
+        env:
+          SUMIKESHI_NO_PAUSE: "1"
+          SUMIKESHI_NO_OPEN: "1"
+        run: |
+          python packaging/smoke.py make smoke
+          .\dist\sumikeshi\sumikeshi.exe auto smoke\doc.docx
+          if ($LASTEXITCODE -gt 1) { throw "auto が失敗（終了コード $LASTEXITCODE）" }
+          .\dist\sumikeshi\sumikeshi.exe smoke\memo.txt
+          if ($LASTEXITCODE -ne 0) { throw "文書を重ねる形が失敗（終了コード $LASTEXITCODE）" }
+          .\dist\sumikeshi\sumikeshi.exe smoke\memo_候補.xlsx
+          if ($LASTEXITCODE -gt 1) { throw "一覧を重ねる形が失敗（終了コード $LASTEXITCODE）" }
+          python packaging/smoke.py check smoke
+          if ($LASTEXITCODE -ne 0) { throw "伏せた文書に名前が残っている" }
+
+      - name: zip にまとめる
+        run: |
+          Copy-Item "packaging\はじめにお読みください.txt" dist\sumikeshi\
+          Compress-Archive -Path dist\sumikeshi -DestinationPath sumikeshi-windows.zip
+          "{0:N1} MB" -f ((Get-Item sumikeshi-windows.zip).Length / 1MB)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sumikeshi-windows
+          path: sumikeshi-windows.zip
+
+      - name: リリースに載せる（v で始まるタグのとき）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sumikeshi-windows.zip
